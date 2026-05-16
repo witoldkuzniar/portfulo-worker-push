@@ -20,7 +20,7 @@
   "kv_namespaces": [
     {
       "binding": "PUSH_COALESCE",
-      "id": "REPLACE_ME_WITH_NAMESPACE_ID"
+      "id": "309b0385d040433b9515bdacaef48682"
     }
   ],
   // Phase E: daily rate cap. Per-user push ceiling, counted against
