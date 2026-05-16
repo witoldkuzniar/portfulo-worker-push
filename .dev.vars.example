@@ -1,0 +1,12 @@
+# Local development secrets. Copy to `.dev.vars` (gitignored) and fill in
+# real values before running `wrangler dev`. Production secrets live in
+# Cloudflare's secret store via `wrangler secret put <NAME>`.
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+APNS_TEAM_ID=WXYZ123456
+APNS_KEY_ID=ABCD1234EF
+APNS_BUNDLE_ID=com.witold.portfulo
+WEBHOOK_SECRET=replace-me-with-a-random-string
+# Paste the .p8 file body as a single line with \n separators OR set via
+# `wrangler secret put APNS_PRIVATE_KEY` (preferred — preserves newlines).
+APNS_PRIVATE_KEY=

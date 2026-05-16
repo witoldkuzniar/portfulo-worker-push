@@ -1,0 +1,21 @@
+{
+  "name": "portfulo-push",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "head_sampling_rate": 1
+    }
+  }
+  // Secrets (set via `wrangler secret put <NAME>`, not committed):
+  //   SUPABASE_URL                  — same value as the iOS app uses
+  //   SUPABASE_SERVICE_ROLE_KEY     — service-role key from Supabase → Settings → API
+  //   APNS_TEAM_ID                  — 10-char ID from Apple Developer account
+  //   APNS_KEY_ID                   — 10-char ID from the APNS Auth Key we generated
+  //   APNS_PRIVATE_KEY              — full PEM contents of the .p8 file (multi-line)
+  //   APNS_BUNDLE_ID                — "com.witold.portfulo"
+  //   WEBHOOK_SECRET                — HMAC shared secret with Supabase Database Webhook
+}
