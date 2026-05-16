@@ -1,11 +1,11 @@
 // Portfulo Push — Cloudflare Worker entry point.
 //
 // Fires once per Supabase Database Webhook invocation. Each invocation
-// represents one row event on `portfolio_data` (INSERT, with future
-// scope for UPDATE in Phase D). The worker decides whether to push,
-// to whom, and what content — see `processWebhook` for the orchestration.
+// represents one row event on `portfolio_data` (INSERT or UPDATE).
+// The worker decides whether to push, to whom, and what content —
+// see `processWebhook` for the orchestration.
 //
-// Phase B + C + D scope (current):
+// Phase B + C + D + E scope (current):
 //   • INSERT + UPDATE handling. iOS uploadData() does an UPSERT keyed
 //     on (portfolio_id, data_type); the first write for each pair is
 //     an INSERT, every subsequent write is an UPDATE. Watching only
@@ -20,18 +20,22 @@
 //   • Quiet hours (Phase D) — TZ-aware window check via
 //     `quietHours.inQuietHours`. Suppresses banners only; the
 //     in-app inbox + app-icon badge still update.
+//   • Per-user daily rate cap (Phase E) — default 20/day, counted
+//     against push_log rows with outcomes that hit APNS. Backstop
+//     for runaway feeds; the in-app inbox always records.
+//   • push_log audit row written at every decision point (Phase E)
+//     — sent, coalesced, quiet_hours, rate_limited, errors all land
+//     as a single PostgREST insert via `writePushLog`. The log feeds
+//     the rate-limit query + future debugging.
+//   • Sentry capture for uncaught errors (Phase E) — events tagged
+//     `service: push-worker` route to the same project iOS/web use.
 //   • Source-device exclusion via the existing `updated_by_device`
 //     column on portfolio_data rows.
 //   • Generic payload — portfolio name + "1 new <dataType>". No
 //     amounts, no encrypted content.
 //   • Dead-token cleanup on APNS 410 + 400 BadDeviceToken.
-//
-// Future phases bolt on without rewriting this orchestration:
-//   • Phase C → coalescing via Cloudflare KV between the prefs check
-//     and the per-token loop.
-//   • Phase D → respect cross_portfolio / shared_portfolio / plaid
-//     toggles + quiet_hours.
-//   • Phase E → push_log + rate-limiting + retry queue.
+
+import * as Sentry from "@sentry/cloudflare";
 
 import type { Env, WebhookPayload, ApnsOutcome } from "./types";
 import { getProviderJWT, sendPush, type ApnsPayload } from "./apns";
@@ -43,46 +47,58 @@ import {
 } from "./supabase";
 import { shouldSendThisEvent } from "./coalesce";
 import { inQuietHours } from "./quietHours";
+import { writePushLog, type PushOutcome } from "./pushLog";
+import { isRateLimited } from "./rateLimit";
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    // Health check — handy when verifying the deploy + DNS without
-    // having to wire the webhook end-to-end first.
-    const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/health") {
+// Sentry's `withSentry` wraps the export so any error thrown inside
+// the handler is captured automatically. Explicit captureException
+// calls still work for caught errors that we want to record without
+// rethrowing.
+export default Sentry.withSentry(
+  (env: Env) => ({
+    dsn: env.SENTRY_DSN,
+    tracesSampleRate: 0,      // tracing off — pure error capture
+    sampleRate: 1.0,          // 100% of errors
+    initialScope: { tags: { service: "push-worker" } },
+  }),
+  {
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+      const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === "/health") {
+        return new Response("ok", { status: 200 });
+      }
+      if (request.method !== "POST" || url.pathname !== "/webhook") {
+        return new Response("Not Found", { status: 404 });
+      }
+
+      // Webhook secret check — constant-time compare avoids length
+      // oracles on the shared secret.
+      const presented = request.headers.get("x-portfulo-webhook-secret") ?? "";
+      if (!constantTimeEqual(presented, env.WEBHOOK_SECRET)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      let payload: WebhookPayload;
+      try {
+        payload = (await request.json()) as WebhookPayload;
+      } catch (err) {
+        console.error("[push] Failed to parse webhook body:", err);
+        Sentry.captureException(err);
+        return new Response("Bad Request", { status: 400 });
+      }
+
+      // Always 200 to Supabase — push delivery is best-effort, the
+      // in-app inbox is the source of truth. Errors inside
+      // processWebhook are captured to Sentry, not bubbled back to
+      // Supabase's retry-bomb logic.
+      ctx.waitUntil(processWebhook(payload, env).catch((err) => {
+        console.error("[push] processWebhook threw:", err);
+        Sentry.captureException(err);
+      }));
       return new Response("ok", { status: 200 });
-    }
-    if (request.method !== "POST" || url.pathname !== "/webhook") {
-      return new Response("Not Found", { status: 404 });
-    }
-
-    // Webhook secret check — Supabase Database Webhooks support custom
-    // headers in the request config; we add `x-portfulo-webhook-secret`
-    // there. Constant-time compare to avoid timing oracles on the
-    // length of the secret.
-    const presented = request.headers.get("x-portfulo-webhook-secret") ?? "";
-    if (!constantTimeEqual(presented, env.WEBHOOK_SECRET)) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    let payload: WebhookPayload;
-    try {
-      payload = (await request.json()) as WebhookPayload;
-    } catch (err) {
-      console.error("[push] Failed to parse webhook body:", err);
-      return new Response("Bad Request", { status: 400 });
-    }
-
-    // We deliberately respond 200 even on internal failures so Supabase
-    // doesn't retry-bomb us — push delivery is best-effort, the in-app
-    // inbox is the source of truth. Log loudly so failures show up in
-    // the wrangler tail / Cloudflare logs.
-    ctx.waitUntil(processWebhook(payload, env).catch((err) => {
-      console.error("[push] processWebhook threw:", err);
-    }));
-    return new Response("ok", { status: 200 });
-  },
-} satisfies ExportedHandler<Env>;
+    },
+  } satisfies ExportedHandler<Env>,
+);
 
 /** Decide whether and how to push for one webhook event. */
 async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> {
@@ -91,9 +107,7 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
     return;
   }
   if (payload.type !== "INSERT" && payload.type !== "UPDATE") {
-    // DELETE-on-portfolio_data is the user clearing a portfolio's
-    // data; no banner makes sense for that. Anything else (e.g. a
-    // future TRUNCATE) is unexpected — bail.
+    // DELETE on portfolio_data is the user clearing data; no banner.
     return;
   }
   const row = payload.record;
@@ -103,47 +117,50 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
   }
   const { portfolio_id: portfolioId, data_type: dataType, updated_by_device: sourceDeviceId } = row;
   if (!portfolioId || !dataType) {
-    console.error("[push] INSERT row missing required columns", row);
+    console.error("[push] row missing required columns", row);
     return;
   }
 
-  // Step 1: portfolio → owner_id
+  // ── Step 1: portfolio → owner_id ─────────────────────────────────
   const portfolio = await fetchPortfolioOwner(env, portfolioId);
   if (!portfolio) {
+    // Can't write push_log without a user_id; just console-log.
     console.log(`[push] Skip — portfolio ${portfolioId} not found (deleted?)`);
     return;
   }
 
-  // Step 2: notification_preferences gate.
+  // ── Step 2: prefs gates ──────────────────────────────────────────
   const prefs = await fetchNotificationPreferences(env, portfolio.owner_id);
   if (!prefs || !prefs.master_enabled) {
     console.log(`[push] Skip — master_enabled false for user ${portfolio.owner_id}`);
+    await logSkip(env, portfolio.owner_id, portfolioId, dataType, "prefs_off", {
+      reason: "master_enabled=false",
+    });
     return;
   }
-  // Phase D: respect per-category toggles. For cross-portfolio
-  // (own-device sync activity — the only source firing today) we
-  // gate on cross_portfolio_enabled. When shared portfolios + Plaid
-  // ship, the categoriser will pick the right toggle per event
-  // source; for now everything is cross_portfolio.
   if (!prefs.cross_portfolio_enabled) {
     console.log(`[push] Skip — cross_portfolio_enabled false for user ${portfolio.owner_id}`);
+    await logSkip(env, portfolio.owner_id, portfolioId, dataType, "prefs_off", {
+      reason: "cross_portfolio_enabled=false",
+    });
     return;
   }
 
-  // Phase D quiet hours. Suppresses the banner during the user's
-  // configured local window — but the in-app inbox still records
-  // the row + the app-icon badge still increments. Returning before
-  // the coalescing step means the user gets a fresh banner the
-  // first time they're past quiet hours and we get a new event.
+  // ── Step 3: quiet hours ──────────────────────────────────────────
   if (inQuietHours(prefs)) {
     console.log(
       `[push] Skip — quiet hours active for user ${portfolio.owner_id} ` +
         `(${prefs.quiet_hours_start} → ${prefs.quiet_hours_end} ${prefs.timezone})`,
     );
+    await logSkip(env, portfolio.owner_id, portfolioId, dataType, "quiet_hours", {
+      start:    prefs.quiet_hours_start,
+      end:      prefs.quiet_hours_end,
+      timezone: prefs.timezone,
+    });
     return;
   }
 
-  // Step 3: load all active tokens, drop the source device.
+  // ── Step 4: load tokens, drop the source device ──────────────────
   const allTokens = await fetchActiveDeviceTokens(env, portfolio.owner_id);
   const targetTokens = allTokens.filter((t) => t.device_id !== sourceDeviceId);
   if (targetTokens.length === 0) {
@@ -151,25 +168,40 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
       `[push] Skip — no target tokens for user ${portfolio.owner_id} ` +
         `(${allTokens.length} active, source=${sourceDeviceId})`,
     );
+    await logSkip(env, portfolio.owner_id, portfolioId, dataType, "no_target_tokens", {
+      active_count:      allTokens.length,
+      source_device_id:  sourceDeviceId,
+    });
     return;
   }
 
-  // Step 3b: coalesce. Check 30s window — if a marker for this
-  // (user, portfolio, dataType) exists, suppress the push. The
-  // marker write happens INSIDE shouldSendThisEvent so a returning
-  // `true` consumes the slot for the rest of the window.
-  // Done AFTER the source-device filter so we don't burn a KV
-  // write on events that have no recipients anyway.
+  // ── Step 5: coalesce ─────────────────────────────────────────────
+  // Inside the source-device filter so we don't burn a KV write on
+  // events that have no recipients anyway. Counted before the
+  // rate-limit check so a coalesced suppression doesn't consume
+  // a slot against the daily cap.
   const fresh = await shouldSendThisEvent(env, portfolio.owner_id, portfolioId, dataType);
   if (!fresh) {
     console.log(
       `[push] Coalesced — within 30s window for ` +
         `(user=${portfolio.owner_id}, portfolio=${portfolioId}, dataType=${dataType})`,
     );
+    await logSkip(env, portfolio.owner_id, portfolioId, dataType, "coalesced");
     return;
   }
 
-  // Step 4: build payload + sign JWT.
+  // ── Step 6: rate limit ───────────────────────────────────────────
+  // Backstop against runaway feeds. Counted AFTER coalescing so
+  // bursts that the window already collapses don't eat the cap.
+  if (await isRateLimited(env, portfolio.owner_id)) {
+    console.warn(`[push] Rate-limited (daily cap) for user ${portfolio.owner_id}`);
+    await logSkip(env, portfolio.owner_id, portfolioId, dataType, "rate_limited", {
+      cap: env.RATE_LIMIT_PER_DAY ?? "20",
+    });
+    return;
+  }
+
+  // ── Step 7: build payload + sign JWT ─────────────────────────────
   const apnsPayload: ApnsPayload = {
     aps: {
       alert: {
@@ -185,17 +217,15 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
   };
   const jwt = await getProviderJWT(env);
 
-  // Step 5: send + handle each outcome. We don't await Promise.all so
-  // one failing token (e.g. APNS 5xx) doesn't block the others.
+  // ── Step 8: parallel send ────────────────────────────────────────
   const results = await Promise.allSettled(
     targetTokens.map(async (token) => {
       const outcome = await sendPush(env, jwt, token.app_env, token.apns_token, apnsPayload);
-      await handleOutcome(env, token.id, token.device_id, outcome);
+      await handleOutcome(env, portfolio.owner_id, portfolioId, dataType, token.id, token.device_id, outcome);
       return outcome;
     }),
   );
 
-  // Summary log — one line per webhook is plenty for the wrangler tail.
   const stats = summarise(results);
   console.log(
     `[push] Sent to ${stats.ok}/${targetTokens.length} ` +
@@ -221,15 +251,27 @@ function bodyFor(dataType: string): string {
   }
 }
 
-/** Per-token cleanup based on APNS response. */
+/** Per-token cleanup + audit log based on APNS response. Writes a
+ *  push_log row per token (delivered / token_dead / apns_error). */
 async function handleOutcome(
   env: Env,
+  userId: string,
+  portfolioId: string,
+  dataType: string,
   tokenRowId: string,
   deviceId: string,
   outcome: ApnsOutcome,
 ): Promise<void> {
   switch (outcome.kind) {
     case "ok":
+      await writePushLog(env, {
+        user_id:      userId,
+        portfolio_id: portfolioId,
+        data_type:    dataType,
+        device_id:    deviceId,
+        apns_status:  200,
+        outcome:      "delivered",
+      });
       return;
     case "gone":
     case "badDeviceToken":
@@ -237,22 +279,75 @@ async function handleOutcome(
         `[push] Token dead (${outcome.kind}, reason=${outcome.reason ?? "?"}) — deactivating ${deviceId}`,
       );
       await deactivateDeviceToken(env, tokenRowId);
+      await writePushLog(env, {
+        user_id:      userId,
+        portfolio_id: portfolioId,
+        data_type:    dataType,
+        device_id:    deviceId,
+        apns_status:  outcome.status,
+        outcome:      "token_dead",
+        detail:       { reason: outcome.reason ?? null, kind: outcome.kind },
+      });
       return;
     case "rateLimited":
-      // APNS asked us to back off. With per-event pushes we can't
-      // realistically retry from inside a single Worker invocation;
-      // Phase E moves this onto a retry queue.
       console.warn(`[push] Rate-limited by APNS for ${deviceId}`);
+      await writePushLog(env, {
+        user_id:      userId,
+        portfolio_id: portfolioId,
+        data_type:    dataType,
+        device_id:    deviceId,
+        apns_status:  outcome.status,
+        outcome:      "apns_error",
+        detail:       { kind: "apns_rate_limited" },
+      });
       return;
     case "serverError":
       console.warn(`[push] APNS ${outcome.status} for ${deviceId}: ${outcome.body ?? ""}`);
+      await writePushLog(env, {
+        user_id:      userId,
+        portfolio_id: portfolioId,
+        data_type:    dataType,
+        device_id:    deviceId,
+        apns_status:  outcome.status,
+        outcome:      "apns_error",
+        detail:       { kind: "server_error", body: outcome.body ?? null },
+      });
       return;
     case "otherClientError":
       console.warn(
         `[push] APNS ${outcome.status} (${outcome.reason ?? "?"}) for ${deviceId}`,
       );
+      await writePushLog(env, {
+        user_id:      userId,
+        portfolio_id: portfolioId,
+        data_type:    dataType,
+        device_id:    deviceId,
+        apns_status:  outcome.status,
+        outcome:      "apns_error",
+        detail:       { kind: "client_error", reason: outcome.reason ?? null },
+      });
       return;
   }
+}
+
+/** Single-line helper for skip-paths that need to write a push_log
+ *  row. Skip paths don't carry a device_id so they're event-scoped
+ *  rather than token-scoped. */
+async function logSkip(
+  env: Env,
+  userId: string,
+  portfolioId: string,
+  dataType: string,
+  outcome: PushOutcome,
+  detail?: Record<string, unknown>,
+): Promise<void> {
+  await writePushLog(env, {
+    user_id:      userId,
+    portfolio_id: portfolioId,
+    data_type:    dataType,
+    outcome,
+    detail,
+  });
 }
 
 interface OutcomeSummary {

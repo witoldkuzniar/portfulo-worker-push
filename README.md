@@ -3,10 +3,15 @@
 Cloudflare Worker that watches Supabase row events on `portfolio_data`
 and posts APNS push notifications to the user's iOS devices.
 
-Phase B scope (current): one banner per INSERT, generic payload, source
-device exclusion, dead-token cleanup. Future phases add coalescing
-(C), per-category preferences + quiet hours (D), retries + rate limits
-(E), tap-through deep links + per-device list (F).
+Current scope: Phases B + C + D + E shipped.
+  • B: per-event push, source-device exclusion, dead-token cleanup.
+  • C: 30s KV-backed coalescing.
+  • D: per-category preference gates + TZ-aware quiet hours.
+  • E: push_log audit table, per-user daily rate cap (20/day),
+       Sentry capture for uncaught errors.
+
+Phase F (tap-through deep links + per-device list with revoke)
+remains pending.
 
 ## Deploy (first time)
 
@@ -24,16 +29,24 @@ npx wrangler secret put APNS_BUNDLE_ID
 npx wrangler secret put WEBHOOK_SECRET            # pick a random string
 # Paste the .p8 file's full contents (including PEM header/footer):
 npx wrangler secret put APNS_PRIVATE_KEY
+# Phase E — same Sentry project the iOS + web apps use:
+npx wrangler secret put SENTRY_DSN
 
-# 3. Create the KV namespace used for 30s coalescing (Phase C).
+# 3. Apply Supabase migrations once via the SQL editor:
+#    supabase/device_tokens.sql              (Phase A)
+#    supabase/notification_preferences.sql   (Phase A)
+#    supabase/push_log.sql                   (Phase E)
+#    All idempotent; safe to re-run.
+
+# 4. Create the KV namespace used for 30s coalescing (Phase C).
 #    Wrangler prints an `id` — paste it into wrangler.jsonc's
 #    `kv_namespaces[0].id` field, replacing REPLACE_ME_WITH_NAMESPACE_ID.
 npx wrangler kv namespace create PUSH_COALESCE
 
-# 4. Deploy
+# 5. Deploy
 npx wrangler deploy
 
-# 5. Verify
+# 6. Verify
 curl https://portfulo-push.<your>.workers.dev/health
 # → "ok"
 ```
