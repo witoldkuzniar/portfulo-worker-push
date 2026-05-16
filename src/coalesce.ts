@@ -1,4 +1,4 @@
-// 30-second coalescing — the spam-prevention layer.
+// 60-second coalescing — the spam-prevention layer.
 //
 // Why this matters: iOS `uploadData()` does an UPSERT per data type,
 // so a single user action that touches N transactions still fires the
@@ -11,11 +11,16 @@
 // Implementation pattern — *front-edge fire, back-edge suppress*:
 //
 //   • First event in a (user, portfolio, dataType) window → KV miss
-//     → we write a marker with 30s TTL and return `true` (push it).
+//     → we write a marker with 60s TTL and return `true` (push it).
 //   • Subsequent events while the marker is alive → KV hit → return
 //     `false` (suppress; the in-app inbox already records the row).
-//   • After 30s the marker expires and the next event starts a fresh
+//   • After 60s the marker expires and the next event starts a fresh
 //     window.
+//
+// Why 60s and not 30s: Cloudflare KV enforces a minimum `expirationTtl`
+// of 60 seconds and rejects shorter values with a 400 error. A previous
+// 30s value made every webhook throw before reaching the push step —
+// effectively breaking pushes silently.
 //
 // Trade-off worth knowing: the banner the user sees says "1 new X"
 // even when the window actually carried 5 of them. That's a known
@@ -33,7 +38,7 @@
 
 import type { Env } from "./types";
 
-const COALESCE_TTL_SECONDS = 30;
+const COALESCE_TTL_SECONDS = 60;
 
 /** Decide whether to send the push for this event. Side effect: on
  *  the first event in a window, writes the marker so subsequent

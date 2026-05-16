@@ -92,13 +92,25 @@ async function importApnsPrivateKey(pem: string): Promise<CryptoKey> {
 }
 
 /** APNS payload as sent to Apple. `aps` is reserved by Apple; the
- *  other top-level keys travel through to the client's userInfo. */
+ *  other top-level keys travel through to the client's userInfo.
+ *
+ *  Body strategy: `mutable-content: 1` enables the iOS app's
+ *  Notification Service Extension, which rewrites `body` on-device
+ *  using the app's per-app preferred language (which APNs's
+ *  loc-key cannot honor — it resolves against the system locale).
+ *  The body sent here is the English fallback shown if the NSE
+ *  fails to run for any reason (delivery timeout, etc.). The NSE
+ *  reads `data_type` and `event_count` from the top-level userInfo
+ *  to pick the right Localizable.strings key. */
 export interface ApnsPayload {
   aps: {
-    alert: { title: string; body: string };
+    alert: {
+      title: string;
+      body: string;
+    };
     sound: "default";
     "thread-id": string;
-    "mutable-content"?: 1;
+    "mutable-content": 1;
   };
   portfolio_id: string;
   data_type: string;

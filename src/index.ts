@@ -206,10 +206,11 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
     aps: {
       alert: {
         title: portfolio.name ?? "Portfolio",
-        body: bodyFor(dataType),
+        body: locKeyFor(dataType),
       },
       sound: "default",
       "thread-id": portfolioId,
+      "mutable-content": 1,
     },
     portfolio_id: portfolioId,
     data_type: dataType,
@@ -234,10 +235,16 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
   );
 }
 
-/** Human-readable body for a given dataType. Kept in English on the
- *  server — the iOS recipient has the full localized inbox; the push
- *  banner is the tease, not the source of truth. */
-function bodyFor(dataType: string): string {
+/** English fallback body for a given dataType. Sent verbatim in the
+ *  push; the iOS Notification Service Extension reads `data_type` from
+ *  the payload's top-level fields, looks up the matching key in the
+ *  app bundle's `Localizable.strings`, and rewrites `body` in the
+ *  user's chosen language. If the NSE fails to run (timeout, low
+ *  memory), iOS shows this English string as a fallback — same
+ *  behavior the app had before localization was attempted. The
+ *  returned strings are valid keys in both `en.lproj` and `pl.lproj`
+ *  Localizable.strings files. */
+function locKeyFor(dataType: string): string {
   switch (dataType) {
     case "assets":            return "1 new asset";
     case "liabilities":       return "1 new liability";
