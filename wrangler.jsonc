@@ -9,7 +9,20 @@
       "invocation_logs": true,
       "head_sampling_rate": 1
     }
-  }
+  },
+  // KV namespace for Phase C coalescing. Create once with:
+  //   npx wrangler kv namespace create PUSH_COALESCE
+  // Wrangler prints an `id` after creation — paste it below in place
+  // of the placeholder. Both the dev-time `preview_id` and the
+  // production `id` can use the same namespace for our purposes;
+  // markers expire automatically so dev fires don't pollute prod
+  // and vice versa.
+  "kv_namespaces": [
+    {
+      "binding": "PUSH_COALESCE",
+      "id": "REPLACE_ME_WITH_NAMESPACE_ID"
+    }
+  ]
   // Secrets (set via `wrangler secret put <NAME>`, not committed):
   //   SUPABASE_URL                  — same value as the iOS app uses
   //   SUPABASE_SERVICE_ROLE_KEY     — service-role key from Supabase → Settings → API

@@ -24,6 +24,17 @@ function authHeaders(env: Env): Record<string, string> {
   };
 }
 
+/** Normalize `SUPABASE_URL` so callers can construct PostgREST paths
+ *  without worrying about the secret's exact shape. Strips any trailing
+ *  slash and an optional `/rest/v1` suffix the user might have included
+ *  by accident — that lookup path is appended by every query below,
+ *  so doubling it produces PGRST125 "Invalid path specified" errors. */
+function restRoot(env: Env): string {
+  return env.SUPABASE_URL
+    .replace(/\/+$/, "")        // strip trailing slash(es)
+    .replace(/\/rest\/v1$/, ""); // strip "/rest/v1" if pasted
+}
+
 /** Look up the portfolio's owner. Returns null when the row no longer
  *  exists (deleted between the webhook firing and the worker reading
  *  — possible in a race; we just drop the push). */
@@ -31,7 +42,7 @@ export async function fetchPortfolioOwner(
   env: Env,
   portfolioId: string,
 ): Promise<PortfolioRow | null> {
-  const url = `${env.SUPABASE_URL}/rest/v1/portfolios?id=eq.${encodeURIComponent(
+  const url = `${restRoot(env)}/rest/v1/portfolios?id=eq.${encodeURIComponent(
     portfolioId,
   )}&select=id,owner_id,name&limit=1`;
   const res = await fetch(url, { headers: authHeaders(env) });
@@ -50,7 +61,7 @@ export async function fetchNotificationPreferences(
   env: Env,
   userId: string,
 ): Promise<NotificationPreferencesRow | null> {
-  const url = `${env.SUPABASE_URL}/rest/v1/notification_preferences?user_id=eq.${encodeURIComponent(
+  const url = `${restRoot(env)}/rest/v1/notification_preferences?user_id=eq.${encodeURIComponent(
     userId,
   )}&limit=1`;
   const res = await fetch(url, { headers: authHeaders(env) });
@@ -68,7 +79,7 @@ export async function fetchActiveDeviceTokens(
   env: Env,
   userId: string,
 ): Promise<DeviceTokenRow[]> {
-  const url = `${env.SUPABASE_URL}/rest/v1/device_tokens?user_id=eq.${encodeURIComponent(
+  const url = `${restRoot(env)}/rest/v1/device_tokens?user_id=eq.${encodeURIComponent(
     userId,
   )}&is_active=eq.true&select=*`;
   const res = await fetch(url, { headers: authHeaders(env) });
@@ -86,7 +97,7 @@ export async function deactivateDeviceToken(
   env: Env,
   tokenRowId: string,
 ): Promise<void> {
-  const url = `${env.SUPABASE_URL}/rest/v1/device_tokens?id=eq.${encodeURIComponent(
+  const url = `${restRoot(env)}/rest/v1/device_tokens?id=eq.${encodeURIComponent(
     tokenRowId,
   )}`;
   const res = await fetch(url, {

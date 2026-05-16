@@ -5,9 +5,15 @@
 // scope for UPDATE in Phase D). The worker decides whether to push,
 // to whom, and what content — see `processWebhook` for the orchestration.
 //
-// Phase B scope (this commit):
-//   • INSERT-only handling.
-//   • Per-event push (one banner per row INSERTed; no coalescing).
+// Phase B + C scope (current):
+//   • INSERT + UPDATE handling. iOS uploadData() does an UPSERT keyed
+//     on (portfolio_id, data_type); the first write for each pair is
+//     an INSERT, every subsequent write is an UPDATE. Watching only
+//     INSERT would silence all post-first-sync activity.
+//   • 30s coalescing window (Phase C) — KV-backed front-edge fire,
+//     back-edge suppress. First event in a (user, portfolio,
+//     dataType) burst pushes; everything else within 30s is silent.
+//     Stops a 50-row Plaid import from generating 50 banners.
 //   • Source-device exclusion via the existing `updated_by_device`
 //     column on portfolio_data rows.
 //   • Generic payload — portfolio name + "1 new <dataType>". No
@@ -29,6 +35,7 @@ import {
   fetchActiveDeviceTokens,
   deactivateDeviceToken,
 } from "./supabase";
+import { shouldSendThisEvent } from "./coalesce";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -76,13 +83,15 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
     console.log(`[push] Skip — unexpected table ${payload.table}`);
     return;
   }
-  if (payload.type !== "INSERT") {
-    // Phase B only handles INSERT. Phase D may add UPDATE.
+  if (payload.type !== "INSERT" && payload.type !== "UPDATE") {
+    // DELETE-on-portfolio_data is the user clearing a portfolio's
+    // data; no banner makes sense for that. Anything else (e.g. a
+    // future TRUNCATE) is unexpected — bail.
     return;
   }
   const row = payload.record;
   if (!row) {
-    console.error("[push] INSERT payload missing record");
+    console.error(`[push] ${payload.type} payload missing record`);
     return;
   }
   const { portfolio_id: portfolioId, data_type: dataType, updated_by_device: sourceDeviceId } = row;
@@ -118,6 +127,21 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
     console.log(
       `[push] Skip — no target tokens for user ${portfolio.owner_id} ` +
         `(${allTokens.length} active, source=${sourceDeviceId})`,
+    );
+    return;
+  }
+
+  // Step 3b: coalesce. Check 30s window — if a marker for this
+  // (user, portfolio, dataType) exists, suppress the push. The
+  // marker write happens INSIDE shouldSendThisEvent so a returning
+  // `true` consumes the slot for the rest of the window.
+  // Done AFTER the source-device filter so we don't burn a KV
+  // write on events that have no recipients anyway.
+  const fresh = await shouldSendThisEvent(env, portfolio.owner_id, portfolioId, dataType);
+  if (!fresh) {
+    console.log(
+      `[push] Coalesced — within 30s window for ` +
+        `(user=${portfolio.owner_id}, portfolio=${portfolioId}, dataType=${dataType})`,
     );
     return;
   }

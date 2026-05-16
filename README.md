@@ -16,7 +16,7 @@ npm install
 npx wrangler login
 
 # 2. Set all secrets (each command prompts for the value)
-npx wrangler secret put SUPABASE_URL
+npx wrangler secret put SUPABASE_URL              # base URL only, NO /rest/v1
 npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
 npx wrangler secret put APNS_TEAM_ID
 npx wrangler secret put APNS_KEY_ID
@@ -25,10 +25,15 @@ npx wrangler secret put WEBHOOK_SECRET            # pick a random string
 # Paste the .p8 file's full contents (including PEM header/footer):
 npx wrangler secret put APNS_PRIVATE_KEY
 
-# 3. Deploy
+# 3. Create the KV namespace used for 30s coalescing (Phase C).
+#    Wrangler prints an `id` — paste it into wrangler.jsonc's
+#    `kv_namespaces[0].id` field, replacing REPLACE_ME_WITH_NAMESPACE_ID.
+npx wrangler kv namespace create PUSH_COALESCE
+
+# 4. Deploy
 npx wrangler deploy
 
-# 4. Verify
+# 5. Verify
 curl https://portfulo-push.<your>.workers.dev/health
 # → "ok"
 ```
