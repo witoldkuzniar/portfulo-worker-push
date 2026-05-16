@@ -5,7 +5,7 @@
 // scope for UPDATE in Phase D). The worker decides whether to push,
 // to whom, and what content — see `processWebhook` for the orchestration.
 //
-// Phase B + C scope (current):
+// Phase B + C + D scope (current):
 //   • INSERT + UPDATE handling. iOS uploadData() does an UPSERT keyed
 //     on (portfolio_id, data_type); the first write for each pair is
 //     an INSERT, every subsequent write is an UPDATE. Watching only
@@ -14,6 +14,12 @@
 //     back-edge suppress. First event in a (user, portfolio,
 //     dataType) burst pushes; everything else within 30s is silent.
 //     Stops a 50-row Plaid import from generating 50 banners.
+//   • Per-category preference gates (Phase D) — currently only
+//     cross_portfolio_enabled is consulted; shared_portfolio and
+//     plaid hooks land when those event sources ship.
+//   • Quiet hours (Phase D) — TZ-aware window check via
+//     `quietHours.inQuietHours`. Suppresses banners only; the
+//     in-app inbox + app-icon badge still update.
 //   • Source-device exclusion via the existing `updated_by_device`
 //     column on portfolio_data rows.
 //   • Generic payload — portfolio name + "1 new <dataType>". No
@@ -36,6 +42,7 @@ import {
   deactivateDeviceToken,
 } from "./supabase";
 import { shouldSendThisEvent } from "./coalesce";
+import { inQuietHours } from "./quietHours";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -113,10 +120,26 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
     console.log(`[push] Skip — master_enabled false for user ${portfolio.owner_id}`);
     return;
   }
-  // Phase B only honours master + cross_portfolio. Per-category +
-  // quiet hours land in Phase D.
+  // Phase D: respect per-category toggles. For cross-portfolio
+  // (own-device sync activity — the only source firing today) we
+  // gate on cross_portfolio_enabled. When shared portfolios + Plaid
+  // ship, the categoriser will pick the right toggle per event
+  // source; for now everything is cross_portfolio.
   if (!prefs.cross_portfolio_enabled) {
     console.log(`[push] Skip — cross_portfolio_enabled false for user ${portfolio.owner_id}`);
+    return;
+  }
+
+  // Phase D quiet hours. Suppresses the banner during the user's
+  // configured local window — but the in-app inbox still records
+  // the row + the app-icon badge still increments. Returning before
+  // the coalescing step means the user gets a fresh banner the
+  // first time they're past quiet hours and we get a new event.
+  if (inQuietHours(prefs)) {
+    console.log(
+      `[push] Skip — quiet hours active for user ${portfolio.owner_id} ` +
+        `(${prefs.quiet_hours_start} → ${prefs.quiet_hours_end} ${prefs.timezone})`,
+    );
     return;
   }
 
