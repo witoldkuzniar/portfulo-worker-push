@@ -254,6 +254,7 @@ function locKeyFor(dataType: string): string {
     case "budgets":           return "1 new budget";
     case "goals":             return "1 new goal";
     case "pendingImports":    return "1 new pending import";
+    case "alertRules":        return "1 alert rule updated";
     default:                  return "1 new update";
   }
 }
