@@ -70,6 +70,21 @@ export interface PortfolioDataRow {
   updated_at: string;
 }
 
+/** A row of `portfolio_members` — created when an owner shares a
+ *  portfolio with another user. A webhook on INSERT lets the recipient
+ *  (`member_user_id`) get a "someone shared a portfolio with you" push.
+ *  The portfolio name stays server-blind (encrypted), so the banner is
+ *  intentionally generic. Not part of `WebhookPayload.record`'s static
+ *  type — the share path casts to this shape. */
+export interface PortfolioMemberRow {
+  id: string;
+  portfolio_id: string;
+  member_user_id: string;
+  role: string;
+  status: string;
+  invited_by: string | null;
+}
+
 /** Mirror of `notification_preferences`. */
 export interface NotificationPreferencesRow {
   user_id: string;

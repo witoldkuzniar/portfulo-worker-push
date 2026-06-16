@@ -37,7 +37,7 @@
 
 import * as Sentry from "@sentry/cloudflare";
 
-import type { Env, WebhookPayload, ApnsOutcome } from "./types";
+import type { Env, WebhookPayload, ApnsOutcome, PortfolioMemberRow } from "./types";
 import { getProviderJWT, sendPush, type ApnsPayload } from "./apns";
 import {
   fetchPortfolioOwner,
@@ -102,6 +102,12 @@ export default Sentry.withSentry(
 
 /** Decide whether and how to push for one webhook event. */
 async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> {
+  // A second webhook (on `portfolio_members`) routes here too — a new
+  // membership row means someone shared a portfolio with the recipient.
+  if (payload.table === "portfolio_members") {
+    await processShareInvite(payload, env);
+    return;
+  }
   if (payload.table !== "portfolio_data") {
     console.log(`[push] Skip — unexpected table ${payload.table}`);
     return;
@@ -232,6 +238,92 @@ async function processWebhook(payload: WebhookPayload, env: Env): Promise<void> 
     `[push] Sent to ${stats.ok}/${targetTokens.length} ` +
       `(portfolio=${portfolioId} dataType=${dataType} ` +
       `gone=${stats.gone} bad=${stats.bad} server=${stats.server} other=${stats.other})`,
+  );
+}
+
+/** Push "someone shared a portfolio with you" to the recipient of a
+ *  new `portfolio_members` row. Deliberately lighter than the data
+ *  feed: a share is rare and high-signal, so we skip the coalescing /
+ *  cross-portfolio / quiet-hours / rate-limit gates and only honour
+ *  the recipient's master + shared-portfolio toggles. The portfolio
+ *  name is encrypted server-side, so the banner stays generic; the
+ *  app fills in the real name after the recipient opens "Shared with
+ *  me" and decrypts. `data_type: "share"` lets the iOS Notification
+ *  Service Extension localize the body (falling back to the English
+ *  string sent here if it doesn't recognize the key). */
+async function processShareInvite(payload: WebhookPayload, env: Env): Promise<void> {
+  // Only the initial invite notifies — role changes / acceptances
+  // arrive as UPDATEs and must stay silent.
+  if (payload.type !== "INSERT") {
+    return;
+  }
+  const row = payload.record as unknown as PortfolioMemberRow | null;
+  if (!row) {
+    console.error("[push] share INSERT missing record");
+    return;
+  }
+  const recipientId = row.member_user_id;
+  const portfolioId = row.portfolio_id;
+  if (!recipientId || !portfolioId) {
+    console.error("[push] share row missing member_user_id/portfolio_id", row);
+    return;
+  }
+  // Skip a self-membership row (owner adding their own row) — nothing
+  // to notify the inviter about their own action.
+  if (row.invited_by && row.invited_by === recipientId) {
+    console.log("[push] Skip share — self-membership row");
+    return;
+  }
+
+  // Honour the recipient's notification toggles. master_enabled is the
+  // global kill-switch; shared_portfolio_enabled is the per-category
+  // gate for exactly this event.
+  const prefs = await fetchNotificationPreferences(env, recipientId);
+  if (prefs && !prefs.master_enabled) {
+    console.log(`[push] Skip share — master_enabled false for user ${recipientId}`);
+    await logSkip(env, recipientId, portfolioId, "share", "prefs_off", { gate: "master" });
+    return;
+  }
+  if (prefs && !prefs.shared_portfolio_enabled) {
+    console.log(`[push] Skip share — shared_portfolio_enabled false for user ${recipientId}`);
+    await logSkip(env, recipientId, portfolioId, "share", "prefs_off", { gate: "shared_portfolio" });
+    return;
+  }
+
+  const tokens = await fetchActiveDeviceTokens(env, recipientId);
+  if (tokens.length === 0) {
+    console.log(`[push] Skip share — no device tokens for user ${recipientId}`);
+    await logSkip(env, recipientId, portfolioId, "share", "no_target_tokens");
+    return;
+  }
+
+  const apnsPayload: ApnsPayload = {
+    aps: {
+      alert: {
+        title: "Portfulo",
+        body: "Someone shared a portfolio with you",
+      },
+      sound: "default",
+      "thread-id": portfolioId,
+      "mutable-content": 1,
+    },
+    portfolio_id: portfolioId,
+    data_type: "share",
+    event_count: 1,
+  };
+  const jwt = await getProviderJWT(env);
+
+  const results = await Promise.allSettled(
+    tokens.map(async (token) => {
+      const outcome = await sendPush(env, jwt, token.app_env, token.apns_token, apnsPayload);
+      await handleOutcome(env, recipientId, portfolioId, "share", token.id, token.device_id, outcome);
+      return outcome;
+    }),
+  );
+  const stats = summarise(results);
+  console.log(
+    `[push] Share push sent to ${stats.ok}/${tokens.length} for user ${recipientId} ` +
+      `(portfolio=${portfolioId} gone=${stats.gone} bad=${stats.bad} server=${stats.server} other=${stats.other})`,
   );
 }
 
