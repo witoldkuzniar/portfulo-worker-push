@@ -24,6 +24,16 @@ function authHeaders(env: Env): Record<string, string> {
   };
 }
 
+// Hard timeout on every PostgREST call so a slow/hung Supabase can't pin a
+// Worker invocation until the platform CPU limit kills it. AbortSignal.timeout
+// is supported on the Workers runtime; on fire the fetch rejects with a
+// TimeoutError, which the callers already turn into a thrown Error (→ Sentry).
+const SUPABASE_TIMEOUT_MS = 5000;
+
+function timedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS) });
+}
+
 /** Normalize `SUPABASE_URL` so callers can construct PostgREST paths
  *  without worrying about the secret's exact shape. Strips any trailing
  *  slash and an optional `/rest/v1` suffix the user might have included
@@ -45,7 +55,7 @@ export async function fetchPortfolioOwner(
   const url = `${restRoot(env)}/rest/v1/portfolios?id=eq.${encodeURIComponent(
     portfolioId,
   )}&select=id,owner_id,name&limit=1`;
-  const res = await fetch(url, { headers: authHeaders(env) });
+  const res = await timedFetch(url, { headers: authHeaders(env) });
   if (!res.ok) {
     throw new Error(`fetchPortfolioOwner failed (${res.status}): ${await res.text()}`);
   }
@@ -64,7 +74,7 @@ export async function fetchNotificationPreferences(
   const url = `${restRoot(env)}/rest/v1/notification_preferences?user_id=eq.${encodeURIComponent(
     userId,
   )}&limit=1`;
-  const res = await fetch(url, { headers: authHeaders(env) });
+  const res = await timedFetch(url, { headers: authHeaders(env) });
   if (!res.ok) {
     throw new Error(`fetchNotificationPreferences failed (${res.status}): ${await res.text()}`);
   }
@@ -82,7 +92,7 @@ export async function fetchActiveDeviceTokens(
   const url = `${restRoot(env)}/rest/v1/device_tokens?user_id=eq.${encodeURIComponent(
     userId,
   )}&is_active=eq.true&select=*`;
-  const res = await fetch(url, { headers: authHeaders(env) });
+  const res = await timedFetch(url, { headers: authHeaders(env) });
   if (!res.ok) {
     throw new Error(`fetchActiveDeviceTokens failed (${res.status}): ${await res.text()}`);
   }
@@ -100,7 +110,7 @@ export async function deactivateDeviceToken(
   const url = `${restRoot(env)}/rest/v1/device_tokens?id=eq.${encodeURIComponent(
     tokenRowId,
   )}`;
-  const res = await fetch(url, {
+  const res = await timedFetch(url, {
     method: "PATCH",
     headers: authHeaders(env),
     body: JSON.stringify({ is_active: false }),
